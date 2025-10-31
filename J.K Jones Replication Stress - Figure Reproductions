@@ -1,0 +1,417 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import tarfile
+import gzip
+import os
+import glob
+import tempfile
+from scipy import stats
+
+#File paths for input and output
+tar_path = r"C:\Users\Vic\Downloads\GSE216926_RAW (2).tar"
+output_dir = r"C:\Users\Vic\Downloads\PhDPAPERS\merged_dataset_nanopore_replication_stress_repspeed"
+
+#Make output directory if it doesn't exist
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+
+print("DNA REPLICATION FORK SPEED ANALYSIS")
+
+#Initialize list for storing results
+summary_stats = []
+
+#Create dictionary to store speeds by treatment type
+treatment_speeds = {}
+treatment_speeds['Untreated'] = []
+treatment_speeds['HU'] = []
+treatment_speeds['ATRi'] = []
+treatment_speeds['WEE1i'] = []
+treatment_speeds['PARPi'] = []
+
+#Pulse time from paper in minutes
+PULSE_TIME_MIN = 15
+
+#Extract files using temporary directory
+temp_dir = tempfile.mkdtemp()
+
+#Extract tar file contents
+tar = tarfile.open(tar_path, 'r')
+tar.extractall(temp_dir)
+tar.close()
+
+#Get all bed.gz files
+pattern = os.path.join(temp_dir, "*.bed.gz")
+gz_files = glob.glob(pattern)
+
+#Process each bed.gz file
+for gz_file in gz_files:
+    filename = os.path.basename(gz_file)
+    
+    try:
+        #Read gzipped BED file
+        f = gzip.open(gz_file, 'rt')
+        df = pd.read_csv(f, sep=r'\s+', header=None, comment='#', engine='python')
+        f.close()
+        
+        #Check if we have enough columns
+        num_columns = df.shape[1]
+        if num_columns < 3:
+            continue
+        
+        #Calculate fork length from BED coordinates
+        start_positions = df[1]
+        end_positions = df[2]
+        fork_length_bp = end_positions - start_positions
+        
+        #Convert to speed in kb/min
+        fork_speed_kb_per_min = fork_length_bp / PULSE_TIME_MIN
+        fork_speed_kb_per_min = fork_speed_kb_per_min / 1000
+        
+        #Apply quality filter from paper
+        valid_speeds = []
+        for speed in fork_speed_kb_per_min:
+            if speed > 0 and speed < 3:
+                valid_speeds.append(speed)
+        
+        valid_speeds = pd.Series(valid_speeds)
+        
+        #Check if we have any valid speeds
+        if len(valid_speeds) == 0:
+            continue
+        
+        #Parse filename for metadata
+        fn = filename.lower()
+        
+        #Determine fork direction
+        direction = 'unknown'
+        if 'leftforks' in fn:
+            direction = 'left'
+        if 'rightforks' in fn:
+            direction = 'right'
+        
+        #Determine treatment condition
+        treatment = 'Unknown'
+        if 'untreated' in fn:
+            treatment = 'Untreated'
+        if '_hu' in fn:
+            treatment = 'HU'
+        if 'hu_' in fn:
+            treatment = 'HU'
+        if 'hu.' in fn:
+            treatment = 'HU'
+        if 'atri' in fn:
+            treatment = 'ATRi'
+        if 'wee1' in fn:
+            treatment = 'WEE1i'
+        if 'parp' in fn:
+            treatment = 'PARPi'
+        if 'papr' in fn:
+            treatment = 'PARPi'
+        
+        #Special handling for HCT116
+        if 'hct116' in fn:
+            if '_wt' in fn:
+                treatment = 'HCT116_WT'
+            elif '_mut' in fn:
+                treatment = 'HCT116_MUT'
+            else:
+                treatment = 'HCT116'
+        
+        #Identify replicate number
+        replicate = 'Rep1'
+        if 'repeat' in fn:
+            replicate = 'Rep2'
+        
+        #Identify cell line
+        cell_line = 'unknown'
+        if 'a2058' in fn:
+            cell_line = 'A2058'
+        if 'hct116' in fn:
+            cell_line = 'HCT116'
+        
+        #Calculate statistics
+        median_speed = valid_speeds.median()
+        mean_speed = valid_speeds.mean()
+        std_speed = valid_speeds.std()
+        q75 = valid_speeds.quantile(0.75)
+        q25 = valid_speeds.quantile(0.25)
+        iqr = q75 - q25
+        
+        #Create dictionary for this file's results
+        file_stats = {}
+        file_stats['filename'] = filename
+        file_stats['treatment'] = treatment
+        file_stats['direction'] = direction
+        file_stats['replicate'] = replicate
+        file_stats['cell_line'] = cell_line
+        file_stats['n_forks'] = len(valid_speeds)
+        file_stats['median_speed'] = median_speed
+        file_stats['mean_speed'] = mean_speed
+        file_stats['std_speed'] = std_speed
+        file_stats['iqr'] = iqr
+        
+        #Add to summary list
+        summary_stats.append(file_stats)
+        
+        #Collect A2058 speeds for histogram generation
+        if cell_line == 'A2058':
+            if treatment in treatment_speeds:
+                speeds_list = valid_speeds.tolist()
+                for speed in speeds_list:
+                    treatment_speeds[treatment].append(speed)
+        
+        print(f"  {treatment:10s} | {direction:5s} | {replicate} | {len(valid_speeds):5d} forks | median={median_speed:.2f}")
+        
+    except Exception as e:
+        print(f"  Error with {filename[:30]}...: {e}")
+        continue
+
+print("Summary Statistics")
+
+#Check if data was processed
+if len(summary_stats) == 0:
+    print("Error")
+    exit(1)
+
+#Convert to dataframe and save
+results_df = pd.DataFrame(summary_stats)
+output_file = os.path.join(output_dir, "summary_corrected_speed.csv")
+results_df.to_csv(output_file, index=False)
+
+print("Summary by Treatment")
+
+#Aggregate by treatment
+treatment_summary = results_df.groupby('treatment').agg({
+    'n_forks': 'sum',
+    'median_speed': lambda x: np.median(treatment_speeds.get(x.name, [0]))  # <-- Median of ALL pooled speeds
+})
+treatment_summary = treatment_summary.round(3)
+print(treatment_summary)
+
+print("COMBINED BY TREATMENT + REPLICATE:")
+
+#Aggregate by treatment and replicate
+combined = results_df.groupby(['treatment', 'replicate']).agg({
+    'n_forks': 'sum',
+    'median_speed': 'mean'
+})
+combined = combined.reset_index()
+combined = combined.round(3)
+print(combined.to_string(index=False))
+
+print("Comparison with Paper")
+
+#Reference values from paper
+paper_values = {}
+paper_values['Untreated'] = 1.46
+paper_values['HU'] = 0.69
+paper_values['ATRi'] = 0.88
+paper_values['WEE1i'] = 1.00
+paper_values['PARPi'] = 1.95
+
+comparison_data = []
+
+#Compare our results with paper values
+treatments_to_check = ['Untreated', 'HU', 'ATRi', 'WEE1i', 'PARPi']
+for treat in treatments_to_check:
+    if treat in treatment_summary.index:
+        your_val = treatment_summary.loc[treat, 'median_speed']
+        paper_val = paper_values[treat]
+        
+        #Create comparison entry
+        entry = {}
+        entry['Treatment'] = treat
+        entry['Your_Data'] = round(your_val, 2)
+        entry['Paper_Median'] = paper_val
+        entry['Match_Ratio'] = round(your_val / paper_val, 2)
+        
+        comparison_data.append(entry)
+
+comparison_df = pd.DataFrame(comparison_data)
+print(comparison_df.to_string(index=False))
+
+print(f"Saved to: {output_file}")
+
+print("Histograms")
+
+#Setup figure with subplots
+fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+#Flatten axes array for easier access
+axes_flat = []
+for row in axes:
+    for ax in row:
+        axes_flat.append(ax)
+
+#Treatment list and colors for plotting
+treatments = ['Untreated', 'HU', 'WEE1i', 'PARPi', 'ATRi']
+colors = ['#3498db', '#e74c3c', '#f39c12', '#9b59b6', '#2ecc71']
+
+#Generate histogram for each treatment
+for i in range(len(treatments)):
+    treatment = treatments[i]
+    color = colors[i]
+    ax = axes_flat[i]
+    
+    data = treatment_speeds[treatment]
+    
+    if len(data) > 0:
+        #Create histogram
+        hist_result = ax.hist(data, bins=30, range=(0, 3), 
+                             color=color, alpha=0.7, edgecolor='black')
+        
+        #Calculate median
+        median = np.median(data)
+        
+        #Add median line
+        ax.axvline(median, color='red', linestyle='--', linewidth=2, label=f'Median={median:.2f}')
+        
+        #Format axes
+        ax.set_xlabel('Fork Speed (kb/min)', fontsize=11, fontweight='bold')
+        ax.set_ylabel('Number of Fork Calls', fontsize=11, fontweight='bold')
+        
+        #Create title with sample size
+        title_text = f'{treatment}\n(N={len(data)} forks)'
+        ax.set_title(title_text, fontsize=12, fontweight='bold')
+        
+        ax.legend(loc='upper right')
+        ax.grid(axis='y', alpha=0.3)
+        ax.set_xlim(0, 3)
+    else:
+        ax.text(0.5, 0.5, f'{treatment}\n No Data', ha='center', va='center', fontsize=12)
+        ax.set_xlim(0, 3)
+
+#Remove unused subplot
+fig.delaxes(axes_flat[5])
+
+plt.suptitle('Fork Speed Distribution by Treatment', fontsize=16, fontweight='bold', y=0.995)
+plt.tight_layout()
+
+#Save histogram figure
+output_png = os.path.join(output_dir, 'fork_speed_histograms.png')
+plt.savefig(output_png, dpi=300, bbox_inches='tight')
+print(f"Saved: {output_png}")
+plt.show()
+
+print("FORK SPEED STATISTICS:")
+
+#Print statistics for each treatment
+for treatment in treatments:
+    data = treatment_speeds[treatment]
+    if len(data) > 0:
+        #Calculate statistics
+        n_value = len(data)
+        median_value = np.median(data)
+        mean_value = np.mean(data)
+        percentile_75 = np.percentile(data, 75)
+        percentile_25 = np.percentile(data, 25)
+        iqr_value = percentile_75 - percentile_25
+        
+        print(f"\n{treatment}:")
+        print(f"  N: {n_value}")
+        print(f"  Median: {median_value:.3f} kb/min")
+        print(f"  Mean: {mean_value:.3f} kb/min")
+        print(f"  IQR: {iqr_value:.3f}")
+
+print("Boxplot")
+
+#Load data for boxplot
+summary = results_df
+
+#Combine replicates
+combined = summary.groupby(['treatment', 'replicate']).agg({
+    'median_speed': 'mean',
+    'n_forks': 'sum'
+})
+combined = combined.reset_index()
+
+#Filter A2058 treatments
+a2058_treatments = ['Untreated', 'HU', 'ATRi', 'WEE1i', 'PARPi']
+plot_data = combined[combined['treatment'].isin(a2058_treatments)]
+
+#Order for plotting
+treatment_order = ['Untreated', 'HU', 'WEE1i', 'PARPi', 'ATRi']
+
+#Prepare data for plotting
+data_by_treatment = []
+labels = []
+
+for treatment in treatment_order:
+    #Get speeds for this treatment
+    treatment_data = plot_data[plot_data['treatment'] == treatment]
+    speeds = treatment_data['median_speed'].values
+    
+    if len(speeds) > 0:
+        data_by_treatment.append(speeds)
+        labels.append(treatment)
+
+#Check if we have data to plot
+if len(data_by_treatment) > 0:
+    #Create figure
+    fig, ax = plt.subplots(figsize=(8, 5))
+    
+    #Draw boxes manually for each treatment
+    for i in range(len(data_by_treatment)):
+        data = data_by_treatment[i]
+        x = i + 1
+        
+        #Calculate quartiles
+        q1 = np.percentile(data, 25)
+        q3 = np.percentile(data, 75)
+        mean_val = np.mean(data)
+        
+        #Draw Q1-Q3 box
+        box_width = 0.4
+        
+        #Q1 line
+        x_left = x - box_width/2
+        x_right = x + box_width/2
+        ax.plot([x_left, x_right], [q1, q1], 'k-', linewidth=2)
+        
+        #Q3 line
+        ax.plot([x_left, x_right], [q3, q3], 'k-', linewidth=2)
+        
+        #Left edge
+        ax.plot([x_left, x_left], [q1, q3], 'k-', linewidth=2)
+        
+        #Right edge
+        ax.plot([x_right, x_right], [q1, q3], 'k-', linewidth=2)
+        
+        #Draw mean point
+        ax.plot(x, mean_val, 'ko', markersize=8, markerfacecolor='black')
+    
+    #Set axis labels
+    ax.set_ylabel('Fork Speed (kb/min)', fontsize=12)
+    ax.set_xlabel('Treatment', fontsize=12)
+    
+    #Set x-axis ticks
+    tick_positions = []
+    for i in range(1, len(labels) + 1):
+        tick_positions.append(i)
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(labels, fontsize=11)
+    
+    #Set limits
+    ax.set_xlim(0.5, len(labels) + 0.5)
+    ax.set_ylim(0, 2.5)
+    
+    #Remove top and right spines
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    
+    plt.tight_layout()
+    
+    #Save boxplot
+    output_png2 = os.path.join(output_dir, 'figure_2c_minimal.png')
+    output_pdf = os.path.join(output_dir, 'figure_2c_minimal.pdf')
+    plt.savefig(output_png2, dpi=300, bbox_inches='tight')
+    plt.savefig(output_pdf, bbox_inches='tight')
+    print(f"Boxplot saved to:")
+    print(f"  {output_png2}")
+    print(f"  {output_pdf}")
+    plt.show()
+
+#Clean up temp directory
+import shutil
+shutil.rmtree(temp_dir)
